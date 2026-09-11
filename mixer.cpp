@@ -31,6 +31,16 @@
 #if defined(__ARM_ARCH_7EM__)
 #define MULTI_UNITYGAIN 65536
 
+// Gain multiply with round-to-nearest instead of the floor() that a plain
+// smulwb()/smulwt() gives.  The 16 bit sample is passed zero extended in the
+// low half of `sample`; moving it up into the high half scales by 1/65536 for
+// the >>32 of smmulr(), and smmulr()'s added half-LSB (0x80000000) becomes the
+// rounding term.
+static inline int32_t multiplyGain(int32_t mult, uint32_t sample)
+{
+	return multiply_32x32_rshift32_rounded(mult, (int32_t)((sample & 0xFFFF) << 16));
+}
+
 static void applyGain(int16_t *data, int32_t mult)
 {
 	uint32_t *p = (uint32_t *)data;
@@ -38,38 +48,38 @@ static void applyGain(int16_t *data, int32_t mult)
 
 	do {
 		uint32_t tmp32 = *p; // read 2 samples from *data
-		int32_t val1 = signed_multiply_32x16b(mult, tmp32);
-		int32_t val2 = signed_multiply_32x16t(mult, tmp32);
+		int32_t val1 = multiplyGain(mult, tmp32);
+		int32_t val2 = multiplyGain(mult, tmp32 >> 16);
 		val1 = signed_saturate_rshift(val1, 16, 0);
 		val2 = signed_saturate_rshift(val2, 16, 0);
 		*p++ = pack_16b_16b(val2, val1);
 	} while (p < end);
 }
 
-static void applyGainThenAdd(int16_t *data, const int16_t *in, int32_t mult)
+// acc[i] += round(mult * in[i] / 65536), keeping the full 32 bit result.
+// Quantizing and saturating once on the final mix avoids requantizing
+// once per channel, this avoids clipping partial sums along the way.
+static void applyGainAccumulate(int32_t *acc, const int16_t *in, int32_t mult)
 {
-	uint32_t *dst = (uint32_t *)data;
-	const uint32_t *src = (uint32_t *)in;
-	const uint32_t *end = (uint32_t *)(data + AUDIO_BLOCK_SAMPLES);
+	const uint32_t *p = (const uint32_t *)in;
+	const uint32_t *end = (const uint32_t *)(in + AUDIO_BLOCK_SAMPLES);
 
 	if (mult == MULTI_UNITYGAIN) {
 		do {
-			uint32_t tmp32 = *dst;
-			*dst++ = signed_add_16_and_16(tmp32, *src++);
-			tmp32 = *dst;
-			*dst++ = signed_add_16_and_16(tmp32, *src++);
-		} while (dst < end);
+			uint32_t tmp32 = *p++;
+			acc[0] = add_32_saturate(acc[0], (int16_t)tmp32);
+			acc[1] = add_32_saturate(acc[1], (int16_t)(tmp32 >> 16));
+			acc += 2;
+		} while (p < end);
+	} else if (mult == 0) {
+		// no contribution, accumulator unchanged
 	} else {
 		do {
-			uint32_t tmp32 = *src++; // read 2 samples from *data
-			int32_t val1 = signed_multiply_32x16b(mult, tmp32);
-			int32_t val2 = signed_multiply_32x16t(mult, tmp32);
-			val1 = signed_saturate_rshift(val1, 16, 0);
-			val2 = signed_saturate_rshift(val2, 16, 0);
-			tmp32 = pack_16b_16b(val2, val1);
-			uint32_t tmp32b = *dst;
-			*dst++ = signed_add_16_and_16(tmp32, tmp32b);
-		} while (dst < end);
+			uint32_t tmp32 = *p++;
+			acc[0] = add_32_saturate(acc[0], multiplyGain(mult, tmp32));
+			acc[1] = add_32_saturate(acc[1], multiplyGain(mult, tmp32 >> 16));
+			acc += 2;
+		} while (p < end);
 	}
 }
 
@@ -81,8 +91,10 @@ static void applyGain(int16_t *data, int32_t mult)
 	const int16_t *end = data + AUDIO_BLOCK_SAMPLES;
 
 	do {
-		int32_t val = *data * mult;
-		*data++ = signed_saturate_rshift(val, 16, 0);
+		// mult is Q8.8 here, so this needs the >> 8 that the ARM version
+		// gets for free from smulwb()'s >> 16
+		int32_t val = *data * mult + 0x80;
+		*data++ = signed_saturate_rshift(val, 16, 8);
 	} while (data < end);
 }
 
@@ -97,7 +109,8 @@ static void applyGainThenAdd(int16_t *dst, const int16_t *src, int32_t mult)
 		} while (dst < end);
 	} else {
 		do {
-			int32_t val = *dst + ((*src++ * mult) >> 8); // overflow possible??
+			// |src * mult| <= 32768 * 32512, so no 32 bit overflow here
+			int32_t val = *dst + ((*src++ * mult + 0x80) >> 8);
 			*dst++ = signed_saturate_rshift(val, 16, 0);
 		} while (dst < end);
 	}
@@ -105,6 +118,47 @@ static void applyGainThenAdd(int16_t *dst, const int16_t *src, int32_t mult)
 
 #endif
 
+#if defined(__ARM_ARCH_7EM__)
+void AudioMixer4::update(void)
+{
+	audio_block_t *in, *out=NULL;
+	unsigned int channel;
+	// Only one object's update() runs at a time (update_all() walks the graph
+	// from the audio interrupt), so one shared accumulator is enough.  Too much
+	// RAM to spend on Teensy LC, which keeps the old per-add saturation below.
+	static int32_t acc[AUDIO_BLOCK_SAMPLES];
+
+	for (channel=0; channel < 4; channel++) {
+		if (!out) {
+			out = receiveWritable(channel);
+			if (out) {
+				memset(acc, 0, sizeof(acc));
+				applyGainAccumulate(acc, out->data, multiplier[channel]);
+			}
+		} else {
+			in = receiveReadOnly(channel);
+			if (in) {
+				applyGainAccumulate(acc, in->data, multiplier[channel]);
+				release(in);
+			}
+		}
+	}
+	if (out) {
+		// the whole mix is quantized and clipped exactly once, here
+		int16_t *dest = out->data;
+		const int32_t *src = acc;
+		const int32_t *end = acc + AUDIO_BLOCK_SAMPLES;
+		do {
+			uint32_t tmp32 = pack_16b_16b(saturate16(src[1]), saturate16(src[0]));
+			*(uint32_t *)dest = tmp32;
+			dest += 2;
+			src += 2;
+		} while (src < end);
+		transmit(out);
+		release(out);
+	}
+}
+#elif defined(KINETISL)
 void AudioMixer4::update(void)
 {
 	audio_block_t *in, *out=NULL;
@@ -130,6 +184,7 @@ void AudioMixer4::update(void)
 		release(out);
 	}
 }
+#endif
 
 void AudioAmplifier::update(void)
 {

@@ -67,6 +67,38 @@ static inline int16_t saturate16(int32_t val)
 #endif
 }
 
+// computes round-to-nearest of a float, saturated to the 16 bit signed range
+static inline int16_t float_to_int16_rounded(float f) __attribute__((always_inline, unused));
+static inline int16_t float_to_int16_rounded(float f)
+{
+	// Adding 1.5 * 2^23 makes the FPU round the value into the low mantissa
+	// bits, so the integer part can just be read out (the classic "magic
+	// number" trick).  Its rounding is round-to-nearest-even, exactly what
+	// lrintf() does in the default rounding mode, but inline - a real call to
+	// lrintf() once per sample is the only reason not to use it here.
+	union { float fp; int32_t i; } u;
+	if (f >= 32767.5f) return 32767;      // also catches +inf
+	if (!(f > -32768.5f)) return -32768;  // also catches -inf and NaN
+	u.fp = f + 12582912.0f; // 1.5 * 2**23
+	return (int16_t)u.i;
+}
+
+// computes (a + b), result saturated to 32 bit signed integer range
+static inline int32_t add_32_saturate(int32_t a, int32_t b) __attribute__((always_inline, unused));
+static inline int32_t add_32_saturate(int32_t a, int32_t b)
+{
+#if defined (__ARM_ARCH_7EM__)
+	int32_t out;
+	asm volatile("qadd %0, %1, %2" : "=r" (out) : "r" (a), "r" (b));
+	return out;
+#else
+	int64_t sum = (int64_t)a + (int64_t)b;
+	if (sum > 2147483647LL) return 2147483647LL;
+	if (sum < -2147483648LL) return -2147483648LL;
+	return (int32_t)sum;
+#endif
+}
+
 // computes ((a[31:0] * b[15:0]) >> 16)
 static inline int32_t signed_multiply_32x16b(int32_t a, uint32_t b) __attribute__((always_inline, unused));
 static inline int32_t signed_multiply_32x16b(int32_t a, uint32_t b)
