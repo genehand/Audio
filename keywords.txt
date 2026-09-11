@@ -46,6 +46,7 @@ AudioAnalyzeToneDetect	KEYWORD2
 AudioAnalyzeNoteFrequency	KEYWORD2
 AudioEffectChorus	KEYWORD2
 AudioEffectFade	KEYWORD2
+AudioEffectGain	KEYWORD2
 AudioEffectFlange	KEYWORD2
 AudioEffectEnvelope	KEYWORD2
 AudioEffectMultiply	KEYWORD2

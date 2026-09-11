@@ -76,6 +76,7 @@
 #include "effect_chorus.h"
 #include "effect_fade.h"
 #include "effect_flange.h"
+#include "effect_gain.h"
 #include "effect_envelope.h"
 #include "effect_multiply.h"
 #include "effect_delay.h"
